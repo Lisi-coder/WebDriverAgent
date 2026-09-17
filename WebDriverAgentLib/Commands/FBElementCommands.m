@@ -35,6 +35,8 @@
 #import "XCUIElement+FBTVFocuse.h"
 #import "XCUIElement+FBResolve.h"
 #import "XCUIElement+FBUID.h"
+#import "XCUIElement+FBClassChain.h"
+#import "XCUIElement+FBFind.h"
 #import "FBElementTypeTransformer.h"
 #import "XCUIElement.h"
 #import "XCUIElementQuery.h"
@@ -114,6 +116,8 @@
 
     [[FBRoute POST:@"/wda/element/:uuid/tap"] respondWithTarget:self action:@selector(handleTap:)],
     [[FBRoute POST:@"/wda/tap"] respondWithTarget:self action:@selector(handleTap:)],
+
+    [[FBRoute POST:@"/wda/tapWaitTap"] respondWithTarget:self action:@selector(handleTapWaitTap:)],
 
     [[FBRoute POST:@"/wda/pickerwheel/:uuid/select"] respondWithTarget:self action:@selector(handleWheelSelect:)],
 #endif
@@ -492,6 +496,110 @@
   }
   [target tap];
   return FBResponseWithOK();
+}
+
++ (nullable XCUIElement *)firstElementUsing:(NSString *)usingText
+                                      value:(NSString *)value
+                                      under:(XCUIElement *)root
+{
+  if ([usingText isEqualToString:@"accessibility id"]
+      || [usingText isEqualToString:@"id"]
+      || [usingText isEqualToString:@"name"]) {
+    return [[root fb_descendantsMatchingIdentifier:value
+                       shouldReturnAfterFirstMatch:YES] firstObject];
+  }
+  if ([usingText isEqualToString:@"predicate string"]) {
+    return [[root fb_descendantsMatchingPredicate:[NSPredicate predicateWithFormat:value]
+                      shouldReturnAfterFirstMatch:YES] firstObject];
+  }
+  if ([usingText isEqualToString:@"class chain"]) {
+    return [[root fb_descendantsMatchingClassChain:value
+                       shouldReturnAfterFirstMatch:YES] firstObject];
+  }
+  return nil;
+}
+
++ (id<FBResponsePayload>)handleTapWaitTap:(FBRouteRequest *)request
+{
+  NSDictionary *firstTap = request.arguments[@"firstTap"];
+  NSDictionary *secondTap = request.arguments[@"secondTap"];
+  NSDictionary *waitFor = request.arguments[@"waitFor"];
+  if (![firstTap isKindOfClass:NSDictionary.class]
+      || ![secondTap isKindOfClass:NSDictionary.class]
+      || ![waitFor isKindOfClass:NSDictionary.class]) {
+    return FBResponseWithStatus([FBCommandStatus invalidArgumentErrorWithMessage:@"'firstTap', 'waitFor', and 'secondTap' dictionaries are required"
+                                                                       traceback:nil]);
+  }
+
+  NSNumber *firstX = firstTap[@"x"];
+  NSNumber *firstY = firstTap[@"y"];
+  NSNumber *secondX = secondTap[@"x"];
+  NSNumber *secondY = secondTap[@"y"];
+  NSString *usingText = waitFor[@"using"];
+  NSString *value = waitFor[@"value"];
+  if (nil == firstX || nil == firstY || nil == secondX || nil == secondY
+      || 0 == usingText.length || 0 == value.length) {
+    return FBResponseWithStatus([FBCommandStatus invalidArgumentErrorWithMessage:@"Both taps need x/y and waitFor needs using/value"
+                                                                       traceback:nil]);
+  }
+  NSSet<NSString *> *supportedStrategies = [NSSet setWithArray:@[
+    @"accessibility id", @"id", @"name", @"predicate string", @"class chain"
+  ]];
+  if (![supportedStrategies containsObject:usingText]) {
+    return FBResponseWithStatus([FBCommandStatus invalidArgumentErrorWithMessage:[NSString stringWithFormat:@"Unsupported waitFor strategy '%@'", usingText]
+                                                                       traceback:nil]);
+  }
+
+  NSTimeInterval timeout = [waitFor[@"timeoutMs"] doubleValue] / 1000.0;
+  NSTimeInterval interval = [waitFor[@"pollMs"] doubleValue] / 1000.0;
+  timeout = timeout > 0 ? MIN(timeout, 5.0) : 1.0;
+  interval = interval > 0 ? MIN(MAX(interval, 0.005), 0.25) : 0.02;
+  BOOL requireHittable = [waitFor[@"requireHittable"] boolValue];
+
+  XCUIApplication *application = request.session.activeApplication;
+  NSError *coordinateError;
+  XCUICoordinate *firstCoordinate = [self gestureCoordinateWithOffset:CGVectorMake(firstX.doubleValue, firstY.doubleValue)
+                                                               element:application
+                                                                 error:&coordinateError];
+  if (nil == firstCoordinate) {
+    return FBResponseWithStatus([FBCommandStatus invalidArgumentErrorWithMessage:coordinateError.localizedDescription
+                                                                       traceback:nil]);
+  }
+  XCUICoordinate *secondCoordinate = [self gestureCoordinateWithOffset:CGVectorMake(secondX.doubleValue, secondY.doubleValue)
+                                                                element:application
+                                                                  error:&coordinateError];
+  if (nil == secondCoordinate) {
+    return FBResponseWithStatus([FBCommandStatus invalidArgumentErrorWithMessage:coordinateError.localizedDescription
+                                                                       traceback:nil]);
+  }
+
+  NSDate *started = NSDate.date;
+  [firstCoordinate tap];
+  NSDate *waitStarted = NSDate.date;
+  __block NSUInteger polls = 0;
+  __block XCUIElement *matchedElement = nil;
+  FBRunLoopSpinner *spinner = [[FBRunLoopSpinner new]
+    timeoutErrorMessage:[NSString stringWithFormat:@"Timed out waiting for %@ '%@'", usingText, value]];
+  [spinner timeout:timeout];
+  [spinner interval:interval];
+  BOOL targetAppeared = [spinner spinUntilTrue:^BOOL{
+    polls += 1;
+    matchedElement = [self firstElementUsing:usingText value:value under:application];
+    return nil != matchedElement && matchedElement.exists && (!requireHittable || matchedElement.hittable);
+  }];
+  if (!targetAppeared) {
+    return FBResponseWithStatus([FBCommandStatus timeoutErrorWithMessage:[NSString stringWithFormat:@"Target did not appear within %.0fms", timeout * 1000.0]
+                                                               traceback:nil]);
+  }
+
+  NSTimeInterval waitMs = -1000.0 * waitStarted.timeIntervalSinceNow;
+  [secondCoordinate tap];
+  NSTimeInterval elapsedMs = -1000.0 * started.timeIntervalSinceNow;
+  return FBResponseWithObject(@{
+    @"elapsedMs": @(elapsedMs),
+    @"waitMs": @(waitMs),
+    @"polls": @(polls),
+  });
 }
 
 + (id<FBResponsePayload>)handlePinch:(FBRouteRequest *)request
