@@ -8,6 +8,8 @@
 
 #import "FBElementCommands.h"
 
+#import <math.h>
+
 #import "FBConfiguration.h"
 #import "FBKeyboard.h"
 #import "FBRoute.h"
@@ -118,6 +120,7 @@
     [[FBRoute POST:@"/wda/tap"] respondWithTarget:self action:@selector(handleTap:)],
 
     [[FBRoute POST:@"/wda/tapWaitTap"] respondWithTarget:self action:@selector(handleTapWaitTap:)],
+    [[FBRoute POST:@"/wda/liveFlashCheckoutBenchmark"] respondWithTarget:self action:@selector(handleLiveFlashCheckoutBenchmark:)],
 
     [[FBRoute POST:@"/wda/pickerwheel/:uuid/select"] respondWithTarget:self action:@selector(handleWheelSelect:)],
 #endif
@@ -599,6 +602,148 @@
     @"elapsedMs": @(elapsedMs),
     @"waitMs": @(waitMs),
     @"polls": @(polls),
+  });
+}
+
++ (id<FBResponsePayload>)handleLiveFlashCheckoutBenchmark:(FBRouteRequest *)request
+{
+  NSArray<NSString *> *requiredNames = @[
+    @"product_buy",
+    @"email_input",
+    @"email_suggestion",
+    @"identity_fill",
+    @"identity_card",
+    @"final_validation",
+  ];
+  NSArray *steps = request.arguments[@"steps"];
+  NSDictionary *expectedSize = request.arguments[@"expectedSize"];
+  if (![steps isKindOfClass:NSArray.class] || steps.count != requiredNames.count) {
+    return FBResponseWithStatus([FBCommandStatus invalidArgumentErrorWithMessage:@"Exactly six LiveFlash benchmark steps are required"
+                                                                       traceback:nil]);
+  }
+  if (![expectedSize isKindOfClass:NSDictionary.class]
+      || nil == expectedSize[@"width"] || nil == expectedSize[@"height"]) {
+    return FBResponseWithStatus([FBCommandStatus invalidArgumentErrorWithMessage:@"expectedSize.width and expectedSize.height are required"
+                                                                       traceback:nil]);
+  }
+
+  XCUIApplication *application = request.session.activeApplication;
+  CGRect appFrame = application.wdFrame;
+  CGSize actualSize = FBAdjustDimensionsForApplication(appFrame.size, application.interfaceOrientation);
+  CGFloat tolerance = expectedSize[@"tolerance"] == nil ? 1.0 : [expectedSize[@"tolerance"] doubleValue];
+  if (fabs(actualSize.width - [expectedSize[@"width"] doubleValue]) > tolerance
+      || fabs(actualSize.height - [expectedSize[@"height"] doubleValue]) > tolerance) {
+    NSString *message = [NSString stringWithFormat:@"Unexpected device point size %.0fx%.0f", actualSize.width, actualSize.height];
+    return FBResponseWithStatus([FBCommandStatus invalidArgumentErrorWithMessage:message traceback:nil]);
+  }
+
+  NSDate *started = NSDate.date;
+  NSMutableArray<NSDictionary *> *timeline = NSMutableArray.array;
+  NSSet<NSString *> *supportedStrategies = [NSSet setWithArray:@[
+    @"accessibility id", @"id", @"name", @"predicate string", @"class chain"
+  ]];
+
+  for (NSUInteger index = 0; index < requiredNames.count; index++) {
+    NSDictionary *step = steps[index];
+    NSString *name = [step isKindOfClass:NSDictionary.class] ? step[@"name"] : nil;
+    NSDictionary *waitFor = [step isKindOfClass:NSDictionary.class] ? step[@"waitFor"] : nil;
+    NSString *usingText = [waitFor isKindOfClass:NSDictionary.class] ? waitFor[@"using"] : nil;
+    NSString *value = [waitFor isKindOfClass:NSDictionary.class] ? waitFor[@"value"] : nil;
+    if (![name isEqualToString:requiredNames[index]]
+        || 0 == usingText.length || 0 == value.length
+        || ![supportedStrategies containsObject:usingText]) {
+      return FBResponseWithStatus([FBCommandStatus invalidArgumentErrorWithMessage:[NSString stringWithFormat:@"Invalid benchmark step at index %lu", (unsigned long)index]
+                                                                         traceback:nil]);
+    }
+
+    BOOL isFinalValidation = index == requiredNames.count - 1;
+    NSDictionary *tap = step[@"tap"];
+    if (isFinalValidation) {
+      if (nil != tap || ([value rangeOfString:@"立即支付"].location == NSNotFound
+                         && [value rangeOfString:@"确认付款"].location == NSNotFound)) {
+        return FBResponseWithStatus([FBCommandStatus invalidArgumentErrorWithMessage:@"The final step must validate a payment-page marker and must not tap"
+                                                                           traceback:nil]);
+      }
+    } else if (![tap isKindOfClass:NSDictionary.class]) {
+      return FBResponseWithStatus([FBCommandStatus invalidArgumentErrorWithMessage:[NSString stringWithFormat:@"Step '%@' requires a tap", name]
+                                                                         traceback:nil]);
+    }
+    if (!isFinalValidation
+        && ([value rangeOfString:@"立即支付"].location != NSNotFound
+            || [value rangeOfString:@"确认付款"].location != NSNotFound)) {
+      return FBResponseWithStatus([FBCommandStatus invalidArgumentErrorWithMessage:@"Payment controls may only be used by the non-tapping final validation step"
+                                                                         traceback:nil]);
+    }
+
+    NSTimeInterval timeout = [waitFor[@"timeoutMs"] doubleValue] / 1000.0;
+    NSTimeInterval interval = [waitFor[@"pollMs"] doubleValue] / 1000.0;
+    timeout = timeout > 0 ? MIN(timeout, 30.0) : 5.0;
+    interval = interval > 0 ? MIN(MAX(interval, 0.005), 0.25) : 0.02;
+    BOOL requireHittable = [waitFor[@"requireHittable"] boolValue];
+
+    NSDate *waitStarted = NSDate.date;
+    __block NSUInteger polls = 0;
+    __block XCUIElement *matchedElement = nil;
+    FBRunLoopSpinner *spinner = [[FBRunLoopSpinner new]
+      timeoutErrorMessage:[NSString stringWithFormat:@"Timed out at LiveFlash step '%@'", name]];
+    [spinner timeout:timeout];
+    [spinner interval:interval];
+    BOOL targetAppeared = [spinner spinUntilTrue:^BOOL{
+      polls += 1;
+      matchedElement = [self firstElementUsing:usingText value:value under:application];
+      return nil != matchedElement && matchedElement.exists && (!requireHittable || matchedElement.hittable);
+    }];
+    NSTimeInterval waitMs = -1000.0 * waitStarted.timeIntervalSinceNow;
+    if (!targetAppeared) {
+      NSTimeInterval elapsedMs = -1000.0 * started.timeIntervalSinceNow;
+      return FBResponseWithObject(@{
+        @"success": @NO,
+        @"failedStep": name,
+        @"elapsedMs": @(elapsedMs),
+        @"timeline": timeline,
+      });
+    }
+
+    NSTimeInterval actionMs = 0;
+    if (!isFinalValidation) {
+      NSDate *actionStarted = NSDate.date;
+      NSString *mode = tap[@"mode"] ?: @"coordinate";
+      if ([mode isEqualToString:@"element"]) {
+        [matchedElement tap];
+      } else if ([mode isEqualToString:@"coordinate"]
+                 && nil != tap[@"x"] && nil != tap[@"y"]) {
+        NSError *coordinateError;
+        XCUICoordinate *coordinate = [self gestureCoordinateWithOffset:CGVectorMake([tap[@"x"] doubleValue], [tap[@"y"] doubleValue])
+                                                                element:application
+                                                                  error:&coordinateError];
+        if (nil == coordinate) {
+          return FBResponseWithStatus([FBCommandStatus invalidArgumentErrorWithMessage:coordinateError.localizedDescription
+                                                                             traceback:nil]);
+        }
+        [coordinate tap];
+      } else {
+        return FBResponseWithStatus([FBCommandStatus invalidArgumentErrorWithMessage:[NSString stringWithFormat:@"Invalid tap for step '%@'", name]
+                                                                           traceback:nil]);
+      }
+      actionMs = -1000.0 * actionStarted.timeIntervalSinceNow;
+    }
+
+    NSTimeInterval elapsedMs = -1000.0 * started.timeIntervalSinceNow;
+    [timeline addObject:@{
+      @"name": name,
+      @"waitMs": @(waitMs),
+      @"actionMs": @(actionMs),
+      @"elapsedMs": @(elapsedMs),
+      @"polls": @(polls),
+    }];
+  }
+
+  NSTimeInterval elapsedMs = -1000.0 * started.timeIntervalSinceNow;
+  return FBResponseWithObject(@{
+    @"success": @YES,
+    @"elapsedMs": @(elapsedMs),
+    @"timeline": timeline,
+    @"paymentClicked": @NO,
   });
 }
 
